@@ -93,43 +93,59 @@ func (g *GeminiBot) Chat(prompt string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to call: %v", err)
 	}
-	if len(resp.Candidates) == 0 || len(resp.Candidates[0].Content.Parts) == 0 {
+	parts := resp.Candidates[0].Content.Parts
+	if len(resp.Candidates) == 0 || len(parts) == 0 {
 		return "", errors.New("empty response from model")
 	}
-	part := resp.Candidates[0].Content.Parts[0]
-	switch v := part.(type) {
-	case genai.Text:
+	frs, err := g.handleFunctionCalls(parts)
+	if err != nil {
+		return "", err
+	}
+	logger.Info(fmt.Sprintf("function response length: %v", len(frs)))
+	if len(frs) == 0 {
+		v, ok := parts[0].(genai.Text)
+		if !ok {
+			return "", err
+		}
 		return string(v), nil
-	case genai.FunctionCall:
-		var data []byte
-		switch v.Name {
+	}
+	resp2, err := chat.SendMessage(ctx, frs...)
+	if err != nil {
+		return "", fmt.Errorf("failed to send function call's response: %v", err)
+	}
+	part2 := resp2.Candidates[0].Content.Parts[0]
+	ret, ok := part2.(genai.Text)
+	if !ok {
+		return "", fmt.Errorf("failed to second response data to Text: %v", resp2)
+	}
+	return string(ret), nil
+}
+
+func (g *GeminiBot) handleFunctionCalls(parts []genai.Part) ([]genai.Part, error) {
+	ps := []genai.Part{}
+	for _, p := range parts {
+		if _, ok := p.(genai.FunctionCall); ok {
+			ps = append(ps, p)
+		}
+	}
+	frs := []genai.Part{}
+	for _, p := range ps {
+		fc, _ := p.(genai.FunctionCall)
+		switch fc.Name {
 		case "fetchWebsiteContent":
-			data, err = fetchWebsiteContentFunc(v.Args)
+			data, err := fetchWebsiteContentFunc(fc.Args)
 			if err != nil {
-				return string(data), err
+				return nil, err
 			}
-			resp2, err := chat.SendMessage(ctx, genai.FunctionResponse{
-				Name: "fetchWebsiteContent",
+			frs = append(frs, genai.FunctionResponse{
+				Name: "fetchWebisiteContent",
 				Response: map[string]any{
 					"content": string(data),
 				},
 			})
-			if err != nil {
-				return "", fmt.Errorf("failed to send second message: %v", err)
-			}
-			part2 := resp2.Candidates[0].Content.Parts[0]
-			ret, ok := part2.(genai.Text)
-			if !ok {
-				return "", fmt.Errorf("failed to second response data to Text: %v", resp2)
-			}
-			return string(ret), nil
-		default:
-			return "", fmt.Errorf("fell into function call default behavior: %v", v.Name)
 		}
-	default:
-		logger.Info(fmt.Sprintf("part detection fell into default case: %#v", part))
-		return "", nil
 	}
+	return frs, nil
 }
 
 // MessageCreateHandler is the discord bot handler for message creation event
