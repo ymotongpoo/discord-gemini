@@ -25,18 +25,22 @@ import (
 
 	"cloud.google.com/go/vertexai/genai"
 	"github.com/bwmarrin/discordgo"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 const (
 	// ModelName is the name of generative AI model for Gemini API.
 	// The names of models are listed on this page.
 	// https://cloud.google.com/vertex-ai/generative-ai/docs/learn/models
-	ModelName   = "gemini-1.5-pro-001"
-	Temperature = 0.4
+	ModelName   = "gemini-1.5-flash-001"
+	Temperature = 0.6
 
 	// LimitConditionPrompt is the supplementary prompt to limit the size and format
 	// of the response from the model not to exceed the discord chat message size.
 	LimitConditionPrompt = "返答は合計2000文字以内にしてください。また出力形式はプレーンテキストにしてください。"
+
+	DiscordTracerLabel = "discord-tracer"
 )
 
 var (
@@ -86,17 +90,25 @@ func NewGeminiBot(ctx context.Context, o *Option) (*GeminiBot, error) {
 // Chat is the wrapper to post a query to Gemini.
 // Internally, it let Gemini model to call function in addition,
 // and through extra context with function call response if necessary.
-func (g *GeminiBot) Chat(prompt string) (string, error) {
-	ctx := context.Background()
+func (g *GeminiBot) Chat(ctx context.Context, prompt string) (string, error) {
+	ctx, span := otel.Tracer(DiscordTracerLabel).Start(ctx, "geminibot.chat")
+	text := genai.Text(prompt + LimitConditionPrompt)
 	chat := g.model.StartChat()
-	resp, err := chat.SendMessage(ctx, genai.Text(prompt+LimitConditionPrompt))
+
+	ctx, smspan := otel.Tracer(DiscordTracerLabel).Start(ctx, "geiminibot.sendmessage.first")
+	resp, err := chat.SendMessage(ctx, text)
 	if err != nil {
 		return "", fmt.Errorf("failed to call: %v", err)
 	}
+	logger.Info(fmt.Sprintf("text prompt: request tokens=%v, response tokens=%v", resp.UsageMetadata.PromptTokenCount, resp.UsageMetadata.CandidatesTokenCount))
+	smspan.SetAttributes(attribute.Int("prompt.token", int(resp.UsageMetadata.PromptTokenCount)))
+	smspan.SetAttributes(attribute.Int("candidates.token", int(resp.UsageMetadata.CandidatesTokenCount)))
+	smspan.SetAttributes(attribute.Int("total.token", int(resp.UsageMetadata.TotalTokenCount)))
 	parts := resp.Candidates[0].Content.Parts
 	if len(resp.Candidates) == 0 || len(parts) == 0 {
 		return "", errors.New("empty response from model")
 	}
+	smspan.End()
 	frs, err := g.handleFunctionCalls(parts)
 	if err != nil {
 		return "", err
@@ -109,15 +121,24 @@ func (g *GeminiBot) Chat(prompt string) (string, error) {
 		}
 		return string(v), nil
 	}
+
+	ctx, smspan2 := otel.Tracer(DiscordTracerLabel).Start(ctx, "geiminibot.sendmessage.second")
 	resp2, err := chat.SendMessage(ctx, frs...)
 	if err != nil {
 		return "", fmt.Errorf("failed to send function call's response: %v", err)
 	}
+	logger.Info(fmt.Sprintf("web content: request tokens=%v, response tokens=%v", resp2.UsageMetadata.PromptTokenCount, resp2.UsageMetadata.CandidatesTokenCount))
+	smspan2.SetAttributes(attribute.Int("prompt.token", int(resp2.UsageMetadata.PromptTokenCount)))
+	smspan2.SetAttributes(attribute.Int("candidates.token", int(resp2.UsageMetadata.CandidatesTokenCount)))
+	smspan2.SetAttributes(attribute.Int("total.token", int(resp2.UsageMetadata.TotalTokenCount)))
+	smspan2.End()
+
 	part2 := resp2.Candidates[0].Content.Parts[0]
 	ret, ok := part2.(genai.Text)
 	if !ok {
-		return "", fmt.Errorf("failed to second response data to Text: %v", resp2)
+		return "", fmt.Errorf("failed to second response data to Text: %v", part2)
 	}
+	span.End()
 	return string(ret), nil
 }
 
@@ -159,11 +180,16 @@ func (g *GeminiBot) MessageCreateHandler(s *discordgo.Session, m *discordgo.Mess
 	// remove mentions from the original query from the discord
 	content := m.Content
 	replaced := mentionPtn.ReplaceAllString(content, "")
-	resp, err := g.Chat(replaced)
+	logger.Info(fmt.Sprintf("sent prompt: %v", replaced))
+
+	ctx := context.Background()
+	ctx, span := otel.Tracer(DiscordTracerLabel).Start(ctx, "geminibot.messagecreatehandler")
+	resp, err := g.Chat(ctx, replaced)
 	if err != nil {
 		logger.Error(fmt.Sprintf("failed to call Gemini: %v", err))
 	}
 	s.ChannelMessageSend(m.ChannelID, resp)
+	span.End()
 }
 
 // fetchWebsiteContentFunc accepts genai.FunctionResponse.Response and

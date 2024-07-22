@@ -51,6 +51,17 @@ func main() {
 	}
 	logger.Info(fmt.Sprintf("configuration (project: %s, location: %s)", o.ProjectID, o.Location))
 
+	tp, err := initTracer(o)
+	if err != nil {
+		logger.Error(fmt.Sprintf("failed to initialize OpenTelemetry: %v", err))
+	}
+	defer func() {
+		if err := tp.Shutdown(context.Background()); err != nil {
+			logger.Error(fmt.Sprintf("failed to shutdown TraceProvider: %v", err))
+		}
+	}()
+	logger.Info("launched TraceProvider")
+
 	if err := run(o); err != nil {
 		logger.Error(fmt.Sprintf("server execution error: %s", err))
 	}
